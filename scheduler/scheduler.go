@@ -87,6 +87,11 @@ func (s *Scheduler) Submit(spec JobSpec) error {
 		s.logf("SUBMIT REJECT job=%s reason=%s", spec.JobID, err.Reason)
 		return err
 	}
+	if cap := s.gangCapacityLocked(spec.Requires); cap < spec.Count {
+		err := &RejectError{RejectGangTooLarge, fmt.Sprintf("gang of %d x %+v exceeds cluster physical limit (max %d tasks placeable)", spec.Count, spec.Requires, cap)}
+		s.logf("SUBMIT REJECT job=%s reason=%s detail=%s", spec.JobID, err.Reason, err.Detail)
+		return err
+	}
 	if q, ok := s.quotas[spec.Owner]; ok {
 		need := scale(spec.Requires, spec.Count)
 		used := s.quotaUsageLocked(spec.Owner)
@@ -192,6 +197,36 @@ func scale(r Resource, n int) Resource {
 	return Resource{CPU: r.CPU * int64(n), Memory: r.Memory * int64(n), GPU: r.GPU * int64(n)}
 }
 
+// gangCapacityLocked 计算整个集群对同一规格任务最多能同时容纳多少个。
+// 整组作业的所有任务规格相同，因此每个节点的容纳数 = 各维度 floor(cap/req) 的最小值，
+// 全部节点求和即为精确上限（不是启发式估算）。按物理容量计算，与节点当前是否
+// 失联、已被占用多少无关——节点恢复或资源释放后该上限才代表“永远排不上”的界限。
+func (s *Scheduler) gangCapacityLocked(req Resource) int {
+	total := 0
+	for _, n := range s.nodes {
+		total += tasksPerNode(n.Capacity, req)
+	}
+	return total
+}
+
+// tasksPerNode 返回单个节点最多能同时放下多少个 req 规格的任务。
+func tasksPerNode(cap, req Resource) int {
+	limit := -1
+	for _, dim := range [][2]int64{{cap.CPU, req.CPU}, {cap.Memory, req.Memory}, {cap.GPU, req.GPU}} {
+		if dim[1] <= 0 {
+			continue // 该维度无需求，不构成约束
+		}
+		n := int(dim[0] / dim[1])
+		if limit < 0 || n < limit {
+			limit = n
+		}
+	}
+	if limit < 0 {
+		return 1 << 30 // 任务无任何资源需求，不构成本维度上限
+	}
+	return limit
+}
+
 // quotaUsageLocked 统计提交方当前占用配额的资源（排队+运行+待重放的任务）。
 func (s *Scheduler) quotaUsageLocked(owner string) Resource {
 	total := Resource{}
@@ -222,8 +257,9 @@ func (s *Scheduler) placePendingTasksLocked() {
 			if nid, ok := s.placeOneLocked(t.Spec.Requires); ok {
 				t.State = TaskRunning
 				t.NodeID = nid
+				t.Generation++
 				t.StartedAt = s.now()
-				s.logf("REPLACE task=%s job=%s -> node=%s (attempt=%d)", t.Spec.TaskID, j.Spec.JobID, nid, t.Attempt)
+				s.logf("REPLACE task=%s job=%s -> node=%s (attempt=%d gen=%d)", t.Spec.TaskID, j.Spec.JobID, nid, t.Attempt, t.Generation)
 			}
 		}
 	}
@@ -253,6 +289,7 @@ func (s *Scheduler) gangScheduleLocked() {
 			s.nodes[nid].Used = s.nodes[nid].Used.Add(t.Spec.Requires)
 			t.State = TaskRunning
 			t.NodeID = nid
+			t.Generation++
 			t.StartedAt = s.now()
 		}
 		j.State = JobRunning
@@ -383,6 +420,13 @@ func (s *Scheduler) onTaskCompletedLocked(ev Event) {
 		s.logf("EVENT DUP task=%s job=%s state=%s: already terminal, ignored", t.Spec.TaskID, j.Spec.JobID, t.State)
 		return
 	}
+	// 跨实例迟到事件：上报的是旧一代实例（被抢占/失联重排前的那一轮），
+	// 即使任务当前已在新一代重新运行，也不能用旧实例的通知判定当前轮。
+	if ev.Generation != 0 && ev.Generation != t.Generation {
+		s.logf("EVENT STALE-GEN task=%s job=%s ev-gen=%d cur-gen=%d state=%s: cross-instance notification, ignored",
+			t.Spec.TaskID, j.Spec.JobID, ev.Generation, t.Generation, t.State)
+		return
+	}
 	if t.State != TaskRunning {
 		s.logf("EVENT STALE task=%s job=%s state=%s: not running, ignored", t.Spec.TaskID, j.Spec.JobID, t.State)
 		return
@@ -435,20 +479,46 @@ func (s *Scheduler) onNodeLostLocked(ev Event) {
 	}
 	n.Alive = false
 	n.Used = Resource{}
-	requeued := 0
+	var rolledBack []string
 	for _, j := range s.jobs {
 		if j.State != JobRunning {
 			continue
 		}
+		hit := false
 		for _, t := range j.Tasks {
 			if t.State == TaskRunning && t.NodeID == ev.NodeID {
-				t.State = TaskPending // 节点失联重入队，不消耗重试次数
-				t.NodeID = ""
-				requeued++
+				hit = true
+				break
 			}
 		}
+		if !hit {
+			continue
+		}
+		s.rollbackGangLocked(j, ev.NodeID)
+		rolledBack = append(rolledBack, j.Spec.JobID)
 	}
-	s.logf("NODE LOST node=%s requeued=%d ledger=%s", ev.NodeID, requeued, s.ledgerStringLocked())
+	s.logf("NODE LOST node=%s gang-rollback=%v ledger=%s", ev.NodeID, rolledBack, s.ledgerStringLocked())
+}
+
+// rollbackGangLocked 把受节点失联影响的作业整组退回等待：失联节点上的任务直接
+// 重入队（失联节点账本已清零，无需归还），健康节点上的同伴任务先归还账本再停掉，
+// 全部未终态任务回到 PENDING，作业重新排队等待整组拉起。不消耗任何重试次数。
+func (s *Scheduler) rollbackGangLocked(j *Job, lostNode string) {
+	for _, t := range j.Tasks {
+		switch t.State {
+		case TaskRunning:
+			if t.NodeID != lostNode {
+				s.releaseLocked(t) // 健康节点上的同伴：归还账本
+			}
+			t.State = TaskPending
+			t.NodeID = ""
+		case TaskPreempted:
+			t.State = TaskPending // 统一回 PENDING，等整组重新拉起
+		}
+	}
+	j.State = JobQueued
+	s.queue = append(s.queue, j)
+	s.logf("GANG ROLLBACK job=%s lost-node=%s: all unfinished tasks requeued (no retry consumed)", j.Spec.JobID, lostNode)
 }
 
 func (s *Scheduler) onNodeRecoveredLocked(ev Event) {
