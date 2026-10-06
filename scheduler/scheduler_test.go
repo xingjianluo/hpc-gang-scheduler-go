@@ -227,61 +227,69 @@ func TestNodeLossDuplicateAndOutOfOrderEvents(t *testing.T) {
 	}
 	t.Logf("placements: %s -> %s, %s -> %s", j.Tasks[0].Spec.TaskID, j.Tasks[0].NodeID, j.Tasks[1].Spec.TaskID, j.Tasks[1].NodeID)
 
-	// n1 失联：其上的任务回到队列，账本归还。
+	// n1 失联：整组回退——n2 上的同伴也一起停下，两个任务都回到等待，
+	// 作业退回排队，健康节点账本同步归还。
 	s.HandleEvent(Event{Type: EventNodeLost, NodeID: "n1"})
 	// 重复的失联事件必须被忽略。
 	s.HandleEvent(Event{Type: EventNodeLost, NodeID: "n1"})
 	logLedger(t, s, "node-lost")
 
 	j, _ = s.Job("j1")
-	var lostTask, aliveTask *Task
+	if j.State != JobQueued {
+		t.Fatalf("job should roll back to queued after node loss, got %s", j.State)
+	}
 	for _, task := range j.Tasks {
-		if task.State == TaskPending {
-			lostTask = task
-		} else {
-			aliveTask = task
+		if task.State != TaskPending {
+			t.Fatalf("gang rollback expected all tasks pending, task %s state=%s", task.Spec.TaskID, task.State)
+		}
+		if task.Attempt != 0 {
+			t.Fatalf("rollback must not consume retries, task %s attempt=%d", task.Spec.TaskID, task.Attempt)
 		}
 	}
-	if lostTask == nil {
-		t.Fatal("expected one task requeued after node loss")
+	// 健康节点 n2 的账本必须还干净。
+	for nid, n := range s.LedgerSnapshot() {
+		if !n.Used.IsZero() {
+			t.Fatalf("ledger not clean after rollback: node=%s used=%+v", nid, n.Used)
+		}
 	}
-	// 乱序/迟到事件：失联节点上任务迟到的完成通知必须被忽略（状态已不是 RUNNING）。
-	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: lostTask.Spec.TaskID, Success: true})
+
+	// 乱序/迟到事件：回退后任务已不在 RUNNING，迟到的完成通知必须被忽略。
+	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: "j1#0", Success: true})
 	j, _ = s.Job("j1")
 	if j.FinishedN != 0 {
 		t.Fatalf("stale completion counted: finishedN=%d", j.FinishedN)
 	}
 
-	// 存活任务完成，随后重复完成通知不能重复计数。
-	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: aliveTask.Spec.TaskID, Success: true})
-	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: aliveTask.Spec.TaskID, Success: true})
+	// 节点恢复后整组重新拉起（重复恢复事件幂等）。
+	s.HandleEvent(Event{Type: EventNodeRecovered, NodeID: "n1"})
+	s.HandleEvent(Event{Type: EventNodeRecovered, NodeID: "n1"})
+	s.Schedule()
+	j, _ = s.Job("j1")
+	if j.State != JobRunning {
+		t.Fatalf("job should be gang-restarted, got %s", j.State)
+	}
+	for _, task := range j.Tasks {
+		if task.State != TaskRunning {
+			t.Fatalf("gang restart expected all tasks running, task %s state=%s", task.Spec.TaskID, task.State)
+		}
+	}
+	logLedger(t, s, "gang-restarted")
+	assertLedgerSane(t, s)
+
+	// 两个任务先后完成；重复完成通知不能重复计数。
+	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: "j1#0", Success: true})
+	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: "j1#0", Success: true})
 	j, _ = s.Job("j1")
 	if j.FinishedN != 1 {
 		t.Fatalf("duplicate completion double-counted: finishedN=%d", j.FinishedN)
 	}
-	if j.Tasks[0].State.Terminal() && j.Tasks[1].State.Terminal() {
-		t.Fatal("job should not be finished yet")
-	}
-
-	// 节点恢复后，被重排的任务能重新调度并最终完成。
-	s.HandleEvent(Event{Type: EventNodeRecovered, NodeID: "n1"})
-	s.HandleEvent(Event{Type: EventNodeRecovered, NodeID: "n1"}) // 重复恢复事件
-	s.Schedule()
-	j, _ = s.Job("j1")
-	lost := j.Tasks[0]
-	if j.Tasks[1].State == TaskPending {
-		lost = j.Tasks[1]
-	}
-	if lost.State != TaskRunning {
-		t.Fatalf("requeued task not rescheduled, state=%s", lost.State)
-	}
-	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: lost.Spec.TaskID, Success: true})
+	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: "j1#1", Success: true})
 	j, _ = s.Job("j1")
 	if j.State != JobSucceeded {
 		t.Fatalf("job should succeed, got %s (finishedN=%d)", j.State, j.FinishedN)
 	}
 	// 终态后迟到的失败事件不能把任务改回非终态。
-	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: lost.Spec.TaskID, Success: false})
+	s.HandleEvent(Event{Type: EventTaskCompleted, JobID: "j1", TaskID: "j1#1", Success: false})
 	j, _ = s.Job("j1")
 	if j.State != JobSucceeded {
 		t.Fatalf("terminal job state regressed: %s", j.State)

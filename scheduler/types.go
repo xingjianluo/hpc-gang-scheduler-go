@@ -1,6 +1,8 @@
 // Package scheduler 实现一个进程内的 HPC 整组（gang）作业调度器，
 // 用模拟节点与资源池代替真实集群，支持整组调度、配额、优先级抢占、
-// 资源回填、任务重试、超时与节点失联后的状态恢复。
+// 资源回填、任务重试、超时与节点失联后的状态恢复；提交时拒绝整组超过
+// 集群物理上限的作业，节点失联时整组回退，并基于运行实例代数对
+// 重复/乱序/跨实例迟到的上报事件去重。
 package scheduler
 
 import "time"
@@ -67,6 +69,9 @@ const (
 	RejectDuplicate      RejectReason = "DUPLICATE_SUBMISSION"
 	RejectQuotaExceeded  RejectReason = "QUOTA_EXCEEDED"
 	RejectResourceUnfits RejectReason = "RESOURCE_NEVER_FITS"
+	// RejectGangExceedsCluster 表示单任务都能放下、但整组需求超过空集群的
+	// 物理上限（按调度器自身的安置算法在空集群上试放失败），永远排不上。
+	RejectGangExceedsCluster RejectReason = "GANG_EXCEEDS_CLUSTER"
 )
 
 // TaskSpec 单个任务的资源需求与标识。
@@ -96,6 +101,9 @@ type Task struct {
 	NodeID    string    `json:"node_id"`
 	Attempt   int       `json:"attempt"`
 	StartedAt time.Time `json:"started_at,omitempty"`
+	// Generation 标识当前运行实例的代数，每次（重新）安置到节点时递增。
+	// 用于识别被抢占/节点失联重排之后，上一轮实例发来的迟到事件。
+	Generation int `json:"generation,omitempty"`
 }
 
 // Job 运行时作业记录。
@@ -125,4 +133,8 @@ type Event struct {
 	NodeID    string    `json:"node_id,omitempty"`
 	Success   bool      `json:"success,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	// Generation 标识上报来自任务的第几代运行实例。>0 时仅当它与任务当前
+	// Generation 相等才受理（防止上一轮实例的迟到通知误判当前这一轮）；
+	// 0 表示未指定，按既有状态机判断（兼容旧行为）。
+	Generation int `json:"generation,omitempty"`
 }

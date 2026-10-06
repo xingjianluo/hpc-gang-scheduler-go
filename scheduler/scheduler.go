@@ -87,6 +87,11 @@ func (s *Scheduler) Submit(spec JobSpec) error {
 		s.logf("SUBMIT REJECT job=%s reason=%s", spec.JobID, err.Reason)
 		return err
 	}
+	if !s.gangFitsEmptyClusterLocked(spec) {
+		err := &RejectError{RejectGangExceedsCluster, fmt.Sprintf("gang of %d x %+v exceeds whole-cluster capacity (empty-cluster trial placement failed)", spec.Count, spec.Requires)}
+		s.logf("SUBMIT REJECT job=%s reason=%s detail=%s", spec.JobID, err.Reason, err.Detail)
+		return err
+	}
 	if q, ok := s.quotas[spec.Owner]; ok {
 		need := scale(spec.Requires, spec.Count)
 		used := s.quotaUsageLocked(spec.Owner)
@@ -192,6 +197,31 @@ func scale(r Resource, n int) Resource {
 	return Resource{CPU: r.CPU * int64(n), Memory: r.Memory * int64(n), GPU: r.GPU * int64(n)}
 }
 
+// gangFitsEmptyClusterLocked 在“空集群”上试放整个作业组：把全部节点（含暂时
+// 失联的，因为失联视为可恢复的）的容量清零后，用与正式调度相同的 first-fit
+// 算法逐个安置 Count 个任务。试放失败说明整组需求超过集群物理上限，永远排不上。
+// 节点规格不一致时该判断按真实安置结果给出，而不是只看最宽节点或总量。
+func (s *Scheduler) gangFitsEmptyClusterLocked(spec JobSpec) bool {
+	free := make(map[string]Resource, len(s.nodes))
+	for id, n := range s.nodes {
+		free[id] = n.Capacity
+	}
+	for i := 0; i < spec.Count; i++ {
+		placed := false
+		for _, nid := range sortedKeys(free) {
+			if spec.Requires.Fits(free[nid]) {
+				free[nid] = free[nid].Sub(spec.Requires)
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			return false
+		}
+	}
+	return true
+}
+
 // quotaUsageLocked 统计提交方当前占用配额的资源（排队+运行+待重放的任务）。
 func (s *Scheduler) quotaUsageLocked(owner string) Resource {
 	total := Resource{}
@@ -222,8 +252,9 @@ func (s *Scheduler) placePendingTasksLocked() {
 			if nid, ok := s.placeOneLocked(t.Spec.Requires); ok {
 				t.State = TaskRunning
 				t.NodeID = nid
+				t.Generation++
 				t.StartedAt = s.now()
-				s.logf("REPLACE task=%s job=%s -> node=%s (attempt=%d)", t.Spec.TaskID, j.Spec.JobID, nid, t.Attempt)
+				s.logf("REPLACE task=%s job=%s -> node=%s (attempt=%d gen=%d)", t.Spec.TaskID, j.Spec.JobID, nid, t.Attempt, t.Generation)
 			}
 		}
 	}
@@ -249,10 +280,14 @@ func (s *Scheduler) gangScheduleLocked() {
 			continue
 		}
 		for _, t := range j.Tasks {
-			nid := placements[t.Spec.TaskID]
+			nid, ok := placements[t.Spec.TaskID]
+			if !ok {
+				continue // 已终态的任务（如回退前已成功）不在本轮安置范围内
+			}
 			s.nodes[nid].Used = s.nodes[nid].Used.Add(t.Spec.Requires)
 			t.State = TaskRunning
 			t.NodeID = nid
+			t.Generation++
 			t.StartedAt = s.now()
 		}
 		j.State = JobRunning
@@ -379,6 +414,13 @@ func (s *Scheduler) onTaskCompletedLocked(ev Event) {
 		s.logf("EVENT IGNORE task=%s job=%s: unknown task", ev.TaskID, ev.JobID)
 		return
 	}
+	// 跨实例去重：事件携带代数时，必须匹配任务当前运行实例的代数，
+	// 否则是被抢占/失联重排后上一轮实例的迟到通知，不能据此判定当前这一轮。
+	if ev.Generation > 0 && ev.Generation != t.Generation {
+		s.logf("EVENT STALE-INSTANCE task=%s job=%s evGen=%d curGen=%d state=%s: ignored",
+			t.Spec.TaskID, j.Spec.JobID, ev.Generation, t.Generation, t.State)
+		return
+	}
 	if t.State.Terminal() {
 		s.logf("EVENT DUP task=%s job=%s state=%s: already terminal, ignored", t.Spec.TaskID, j.Spec.JobID, t.State)
 		return
@@ -435,20 +477,48 @@ func (s *Scheduler) onNodeLostLocked(ev Event) {
 	}
 	n.Alive = false
 	n.Used = Resource{}
-	requeued := 0
+	// 整组回退：只要作业有一个运行中任务落在失联节点上，就把该作业在健康
+	// 节点上的同伴也一起停下，整组退回队列等待重新整组拉起，避免同一个
+	// 作业一半在跑、一半在等。回退不消耗任务的重试次数（Attempt 不变）。
+	rolledBack := 0
 	for _, j := range s.jobs {
 		if j.State != JobRunning {
 			continue
 		}
+		hit := false
 		for _, t := range j.Tasks {
 			if t.State == TaskRunning && t.NodeID == ev.NodeID {
-				t.State = TaskPending // 节点失联重入队，不消耗重试次数
-				t.NodeID = ""
-				requeued++
+				hit = true
+				break
 			}
 		}
+		if !hit {
+			continue
+		}
+		for _, t := range j.Tasks {
+			if t.State != TaskRunning {
+				continue // 已终态（如已成功）的任务保持原状，不重跑
+			}
+			s.releaseLocked(t) // 失联节点账本已清零，健康节点在此归还
+			t.State = TaskPending
+			t.NodeID = ""
+		}
+		j.State = JobQueued
+		s.enqueueLocked(j)
+		rolledBack++
+		s.logf("GANG ROLLBACK job=%s node=%s: all running tasks requeued (attempts preserved)", j.Spec.JobID, ev.NodeID)
 	}
-	s.logf("NODE LOST node=%s requeued=%d ledger=%s", ev.NodeID, requeued, s.ledgerStringLocked())
+	s.logf("NODE LOST node=%s rolledBackJobs=%d ledger=%s", ev.NodeID, rolledBack, s.ledgerStringLocked())
+}
+
+// enqueueLocked 把作业放回等待队列（幂等，避免重复入队）。
+func (s *Scheduler) enqueueLocked(j *Job) {
+	for _, q := range s.queue {
+		if q == j {
+			return
+		}
+	}
+	s.queue = append(s.queue, j)
 }
 
 func (s *Scheduler) onNodeRecoveredLocked(ev Event) {
